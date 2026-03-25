@@ -15,6 +15,7 @@ import (
 	"github.com/exaring/otelpgx"
 	pgxzero "github.com/jackc/pgx-zerolog"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/tracelog"
 	"github.com/rs/zerolog"
@@ -126,44 +127,98 @@ func (c *ConfigLoader) InitDataLayer() (res *database.Layer, err error) {
 		_ = os.Setenv("DATABASE_URL", databaseUrl)
 	}
 
-	pgxpoolConnAfterConnect := func(ctx context.Context, conn *pgx.Conn) error {
+	// afterConnectFull is used for direct Postgres connections (no pgbouncer).
+	// It calls LoadType which uses the extended query protocol — safe for direct connections
+	// but not for pgbouncer in transaction mode.
+	afterConnectFull := func(ctx context.Context, conn *pgx.Conn) error {
 		// Set timezone to UTC for all connections
 		if _, err := conn.Exec(ctx, "SET TIME ZONE 'UTC'"); err != nil {
 			return err
 		}
 
 		// ref: https://github.com/jackc/pgx/issues/1549
-		t, err := conn.LoadType(ctx, "v1_readable_status_olap")
-		if err != nil {
-			return err
+		for _, typeName := range []string{
+			"v1_readable_status_olap", "_v1_readable_status_olap",
+			"v1_log_line_level", "_v1_log_line_level",
+		} {
+			t, err := conn.LoadType(ctx, typeName)
+			if err != nil {
+				l.Error().Err(err).Str("type", typeName).Msg("AfterConnect: failed to load custom type " +
+					"(hint: pgbouncer in transaction mode does not support the extended query protocol — " +
+					"set DATABASE_PGBOUNCER_ENABLED=true and DATABASE_DIRECT_URL to fix this)")
+				return err
+			}
+			conn.TypeMap().RegisterType(t)
 		}
 
-		conn.TypeMap().RegisterType(t)
-
-		t, err = conn.LoadType(ctx, "_v1_readable_status_olap")
-		if err != nil {
-			return err
-		}
-
-		conn.TypeMap().RegisterType(t)
-
-		t, err = conn.LoadType(ctx, "v1_log_line_level")
-		if err != nil {
-			return err
-		}
-
-		conn.TypeMap().RegisterType(t)
-
-		t, err = conn.LoadType(ctx, "_v1_log_line_level")
-		if err != nil {
-			return err
-		}
-
-		conn.TypeMap().RegisterType(t)
-
-		_, err = conn.Exec(ctx, "SET statement_timeout=30000")
-
+		_, err := conn.Exec(ctx, "SET statement_timeout=30000")
 		return err
+	}
+
+	if cf.PgBouncerEnabled && cf.DirectDatabaseURL == "" {
+		return nil, fmt.Errorf("DATABASE_PGBOUNCER_ENABLED is set but DATABASE_DIRECT_URL is not; " +
+			"a direct PostgreSQL connection is required for DDL operations like DETACH PARTITION CONCURRENTLY")
+	}
+
+	// A small direct pool for DDL operations that cannot go through pgbouncer
+	// (e.g. DETACH PARTITION CONCURRENTLY which cannot run inside a transaction block).
+	// When pgbouncer is enabled this pool is also used at startup to preload custom type
+	// OIDs so that pgbouncer pool connections can register them without calling LoadType
+	// (which uses the extended query protocol, unsupported by pgbouncer in transaction mode).
+	// The direct pool is created first so its connections are available before the main pool
+	// attempts to establish any connections.
+	var directPool *pgxpool.Pool
+
+	if cf.DirectDatabaseURL != "" {
+		directConfig, err := pgxpool.ParseConfig(cf.DirectDatabaseURL)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse direct database url: %w", err)
+		}
+
+		if cf.DirectDatabaseMaxConns != 0 {
+			directConfig.MaxConns = int32(cf.DirectDatabaseMaxConns) // nolint: gosec
+		}
+
+		if cf.DirectDatabaseMinConns != 0 {
+			directConfig.MinConns = int32(cf.DirectDatabaseMinConns) // nolint: gosec
+		}
+
+		directConfig.MaxConnLifetime = cf.MaxConnLifetime
+		directConfig.MaxConnIdleTime = cf.MaxConnIdleTime
+		directConfig.AfterConnect = afterConnectFull
+		directConfig.ConnConfig.Tracer = newOTelPgxTracer()
+
+		directPool, err = pgxpool.NewWithConfig(context.Background(), directConfig)
+		if err != nil {
+			return nil, fmt.Errorf("could not connect to direct database: %w", err)
+		}
+	}
+
+	// pgxpoolConnAfterConnect is the hook used for the main pool and read replica.
+	// When pgbouncer is enabled, we cannot call LoadType (extended query protocol) on
+	// pgbouncer connections. Instead we preload the type OIDs once via the direct pool
+	// at startup and register them using RegisterType, which is a pure in-memory operation
+	// with no protocol traffic. Type OIDs are stable for the lifetime of the schema.
+	pgxpoolConnAfterConnect := afterConnectFull
+	if cf.PgBouncerEnabled {
+		customTypeNames := []string{
+			"v1_readable_status_olap", "_v1_readable_status_olap",
+			"v1_log_line_level", "_v1_log_line_level",
+		}
+		preloadedTypes, err := loadTypesFromDirectPool(context.Background(), directPool, customTypeNames)
+		if err != nil {
+			return nil, fmt.Errorf("could not preload custom pg types via direct connection: %w", err)
+		}
+		pgxpoolConnAfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+			if _, err := conn.Exec(ctx, "SET TIME ZONE 'UTC'"); err != nil {
+				return err
+			}
+			for _, t := range preloadedTypes {
+				conn.TypeMap().RegisterType(t)
+			}
+			_, err := conn.Exec(ctx, "SET statement_timeout=30000")
+			return err
+		}
 	}
 
 	config, err := pgxpool.ParseConfig(databaseUrl)
@@ -260,40 +315,6 @@ func (c *ConfigLoader) InitDataLayer() (res *database.Layer, err error) {
 
 		if err != nil {
 			return nil, fmt.Errorf("could not connect to read replica database: %w", err)
-		}
-	}
-
-	// A small direct pool for DDL operations that cannot go through pgbouncer
-	// (e.g. DETACH PARTITION CONCURRENTLY which cannot run inside a transaction block).
-	var directPool *pgxpool.Pool
-
-	if cf.PgBouncerEnabled && cf.DirectDatabaseURL == "" {
-		return nil, fmt.Errorf("DATABASE_PGBOUNCER_ENABLED is set but DATABASE_DIRECT_URL is not; " +
-			"a direct PostgreSQL connection is required for DDL operations like DETACH PARTITION CONCURRENTLY")
-	}
-
-	if cf.DirectDatabaseURL != "" {
-		directConfig, err := pgxpool.ParseConfig(cf.DirectDatabaseURL)
-		if err != nil {
-			return nil, fmt.Errorf("could not parse direct database url: %w", err)
-		}
-
-		if cf.DirectDatabaseMaxConns != 0 {
-			directConfig.MaxConns = int32(cf.DirectDatabaseMaxConns) // nolint: gosec
-		}
-
-		if cf.DirectDatabaseMinConns != 0 {
-			directConfig.MinConns = int32(cf.DirectDatabaseMinConns) // nolint: gosec
-		}
-
-		directConfig.MaxConnLifetime = cf.MaxConnLifetime
-		directConfig.MaxConnIdleTime = cf.MaxConnIdleTime
-		directConfig.AfterConnect = pgxpoolConnAfterConnect
-		directConfig.ConnConfig.Tracer = newOTelPgxTracer()
-
-		directPool, err = pgxpool.NewWithConfig(context.Background(), directConfig)
-		if err != nil {
-			return nil, fmt.Errorf("could not connect to direct database: %w", err)
 		}
 	}
 
@@ -989,4 +1010,26 @@ func firstNWords(s string, n int) string {
 		end += next + 1
 	}
 	return strings.ToUpper(strings.TrimSpace(s[:end]))
+}
+
+// loadTypesFromDirectPool acquires a single connection from pool, loads each named
+// custom type via the extended query protocol (safe on direct Postgres connections),
+// and returns the resulting *pgtype.Type values. These can then be registered on
+// pgbouncer connections via RegisterType without any protocol traffic.
+func loadTypesFromDirectPool(ctx context.Context, pool *pgxpool.Pool, typeNames []string) ([]*pgtype.Type, error) {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("could not acquire direct connection to load custom types: %w", err)
+	}
+	defer conn.Release()
+
+	types := make([]*pgtype.Type, 0, len(typeNames))
+	for _, name := range typeNames {
+		t, err := conn.Conn().LoadType(ctx, name)
+		if err != nil {
+			return nil, fmt.Errorf("could not load type %q via direct connection: %w", name, err)
+		}
+		types = append(types, t)
+	}
+	return types, nil
 }
